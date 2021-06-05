@@ -5,62 +5,79 @@ import pyaudio
 import time
 import audioop
 import numpy as np
+import random
 
 RED = Colour(255,0,0)
 GREEN = Colour(0,255,0)
 BLUE = Colour(0,0,255)
 
+# create some global constants
+SAMPLE_RATE = 44100
+BUFFER_SIZE = 4
 
+def decode(in_data, channels):
+    '''
+    convert a byte stream into a 2D numpy array with 
+    shape (chunk_size, channels)
 
-fc = 0.1  # Cutoff frequency as a fraction of the sampling rate (in (0, 0.5)).
-b = 0.08  # Transition band, as a fraction of the sampling rate (in (0, 0.5)).
-N = int(np.ceil((4 / b)))
-if not N % 2: N += 1  # Make sure that N is odd.
-n = np.arange(N)
- 
-# Compute sinc filter.
-h = np.sinc(2 * fc * (n - (N - 1) / 2))
- 
-# Compute Blackman window.
-w = 0.42 - 0.5 * np.cos(2 * np.pi * n / (N - 1)) + \
-    0.08 * np.cos(4 * np.pi * n / (N - 1))
- 
-# Multiply sinc filter by window.
-h = h * w
- 
-# Normalize to get unity gain.
-h = h / np.sum(h)
+    Samples are interleaved, so for a stereo stream with left channel 
+    of [L0, L1, L2, ...] and right channel of [R0, R1, R2, ...], the output 
+    is ordered as [L0, R0, L1, R1, ...]
+    '''
+    # convert between pyaudio/numpy types
+    result = np.fromstring(in_data, dtype=np.float32)
+    chunk_length = len(result) / channels
+    assert chunk_length == int(chunk_length)
 
+    return np.reshape(result, (int(chunk_length), int(channels)))
 
 ###########################################################################
+def encode(signal):
+    """
+    Convert a 2D numpy array into a byte stream for PyAudio
+
+    Signal should be a numpy array with shape (chunk_size, channels)
+    """
+    interleaved = signal.flatten()
+    # convert between pyaudio/numpy types
+    out_data = interleaved.astype(np.float32).tostring()
+    return out_data
+
+##############################################################################
 def get_rms():
     # Creates a generator that can iterate rms values
-    CHUNK = 8
     WIDTH = 2
-    CHANNELS = 1
-    RATE = 44100
+    CHANNELS = 2
     
     p = pyaudio.PyAudio()
 
-    
     try:
         stream = p.open(format=p.get_format_from_width(WIDTH),
                         channels=CHANNELS,
-                        rate=RATE,
+                        rate=SAMPLE_RATE,
                         input=True,
                         output=False,
-                        frames_per_buffer=CHUNK)
+                        frames_per_buffer=BUFFER_SIZE)
         # wait a second to allow the stream to be setup
         time.sleep(1)
         while True:
             # read the data
-            data = stream.read(CHUNK, exception_on_overflow = False)
-            # apply low pass filter
-            rms = audioop.rms(data, 1)
+            data = stream.read(BUFFER_SIZE, exception_on_overflow = False)
+            
+            # split into left and right channels
+            result = decode(data, CHANNELS)
+            left = encode(result[:, 0])
+            right = encode(result[:, 1])
+  
+            L_rms = audioop.rms(left, WIDTH)
+            R_rms = audioop.rms(right, WIDTH)
+
+            
             # Scale the rms value to be within 0-255
-            rms_scaled = (rms / 1024) * 255
-            if rms_scaled <= 255 and rms_scaled >= 0:
-                yield rms_scaled
+            L_rms_scaled = int((L_rms / 8192) * 255)
+            R_rms_scaled = int((R_rms / 8192) * 255)
+            if L_rms_scaled <= 255 and L_rms_scaled >= 0 and R_rms_scaled <= 255 and R_rms_scaled >= 0:
+                yield L_rms_scaled, R_rms_scaled
     finally:
         p.terminate()
         stream.stop_stream()
@@ -74,9 +91,24 @@ def set_and_update(universe, interface):
     interface.send_update()
 
 ##############################################################################
+def create_rms_colour(rms_one, rms_two):
+    rms_three = abs(rms_one - rms_two)
+    RMS_LIST = [rms_one, rms_two, rms_three]
+    r_1 = random.randint(0,2)
+    r_2 = random.randint(0,2)
+    r_3 = random.randint(0,2)
+    return_colour = Colour(RMS_LIST[r_1],
+                           RMS_LIST[r_1],
+                           RMS_LIST[r_1])
+    return(return_colour)
+
+##############################################################################
 def main():
     # create an instance of the RMS generator
     audio_feed = get_rms()
+
+    #setup random
+    random.seed(500)
 
     # Open an interface
     with DMXInterface("FT232R") as interface:
@@ -95,17 +127,20 @@ def main():
         light.set_brightness(0)
         light_two.set_brightness(0)
         set_and_update(universe, interface)
-        
-        'create a reset light'
-        seq_one = [RED, GREEN, BLUE, RED, RED]
-        seq_two = [GREEN, BLUE, RED, BLUE, BLUE]
+       
+        colour = Colour(0,0,0)
+        for L_rms, R_rms in audio_feed:
+            D_rms = int((L_rms + R_rms) * 0.5)
+            rms_colours = [Colour(L_rms,R_rms,D_rms), Colour(R_rms,L_rms,D_rms), Colour(D_rms,R_rms,L_rms)]
+            # if no audio keep updating the colour
+            if L_rms <= 10 and R_rms <= 10:
+                colour = random.choice(rms_colours)
 
+            light.set_brightness(255)
+            light.set_colour(colour)
 
-        for rms in audio_feed:  
-            light.set_brightness(rms)
-            light.set_colour(GREEN)
-            light_two.set_colour(BLUE)
-            light_two.set_brightness(rms)
+            light_two.set_colour(colour)
+            light_two.set_brightness(255)
             # set frame and update
             set_and_update(universe, interface)
             #sleep(0.5 - (15.0 / 1000.0))
